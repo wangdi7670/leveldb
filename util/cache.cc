@@ -197,28 +197,88 @@ class LRUCache {
 
 LRUCache::LRUCache() : capacity_(0), usage_(0) {
   // Make empty circular linked lists.
+  lru_.next = &lru_;
+  lru_.prev = &lru_;
+  in_use_.next = &in_use_;
+  in_use_.prev = &in_use_;
 }
 
 LRUCache::~LRUCache() {
+  while (lru_.next != &lru_) {
+    Unref(lru_.next);
+  }
+  while (in_use_.next != &in_use_) {
+    auto *old = in_use_.next;
+    assert(old->refs >= 2);
+    old->refs--;
+    old->in_cache = false;
+    LRU_Remove(old);
+  }
 }
 
 void LRUCache::Ref(LRUHandle* e) {
+  assert(e->in_cache);
+  if (e->refs == 1) {
+    e->refs++;
+    LRU_Remove(e);
+    LRU_Append(&in_use_, e);
+  } else if (e->refs >= 2) {
+    e->refs++;
+  }
 }
 
 void LRUCache::Unref(LRUHandle* e) {
+  assert(e != nullptr);
+  assert(e->refs > 0);
+
+  if (e->refs == 1 && e->in_cache) {
+    // lru_
+    LRU_Remove(e);
+    e->refs--;  
+    e->in_cache = false;
+  } else if (e->in_cache && e->refs >= 2) {
+    // in_use_
+    e->refs--;
+    if (e->refs == 1) {
+      LRU_Remove(e);
+      LRU_Append(&lru_, e);
+    }
+  } else if (!e->in_cache) {
+    e->refs--;
+  }
+
+  if (e->refs == 0) {
+    LRU_Remove(e);
+    (*e->deleter)(e->key(), e->value);
+    free(e);
+  }
 }
 
 void LRUCache::LRU_Remove(LRUHandle* e) {
+  e->prev->next = e->next;
+  e->next->prev = e->prev;
 }
 
 void LRUCache::LRU_Append(LRUHandle* list, LRUHandle* e) {
+  list->prev->next = e;
+  e->prev = list->prev;
+  list->prev = e;
+  e->next = list;
 }
 
 Cache::Handle* LRUCache::Lookup(const Slice& key, uint32_t hash) {
+  LRUHandle *h = table_.Lookup(key, hash);
+  if (h != nullptr) {
+    Ref(h);
+  }
+  return reinterpret_cast<Cache::Handle *>(h);
 }
 
 void LRUCache::Release(Cache::Handle* handle) {
   MutexLock l(&mutex_);
+  assert(handle != nullptr);
+  LRUHandle *h = reinterpret_cast<LRUHandle *>(handle);
+  Unref(h);
 }
 
 Cache::Handle* LRUCache::Insert(const Slice& key, uint32_t hash, void* value,
@@ -226,20 +286,59 @@ Cache::Handle* LRUCache::Insert(const Slice& key, uint32_t hash, void* value,
                                 void (*deleter)(const Slice& key,
                                                 void* value)) {
   MutexLock l(&mutex_);
+  LRUHandle *handle = (LRUHandle *)malloc(sizeof(LRUHandle) - 1 + key.size());
+  handle->value = value;
+  handle->deleter = deleter;
+  handle->next_hash = nullptr;
+  handle->next = nullptr;
+  handle->prev = nullptr;
+  handle->charge = charge;
+  handle->key_length = key.size();
+  handle->in_cache = true;
+  handle->refs = 1;
+  handle->hash = hash;
+  memcpy(handle->key_data, key.data(), key.size());
+  LRU_Append(&lru_, handle);
 
+  if (capacity_ > 0) {
+    Ref(handle);
+    FinishErase(table_.Insert(handle));
+    usage_ += charge;
+  } else {
+    handle->in_cache = false;
+  }
+
+  while (usage_ > capacity_ && lru_.next != &lru_) {
+    usage_ -= lru_.next->charge;
+    table_.Remove(lru_.next->key(), lru_.next->hash);
+    Unref(lru_.next);
+  }
+
+  return reinterpret_cast<Cache::Handle *>(handle);
 }
 
 // If e != nullptr, finish removing *e from the cache; it has already been
 // removed from the hash table.  Return whether e != nullptr.
 bool LRUCache::FinishErase(LRUHandle* e) {
+  if (e != nullptr) {
+    Unref(e);
+  }
+  return e != nullptr;
 }
 
 void LRUCache::Erase(const Slice& key, uint32_t hash) {
   MutexLock l(&mutex_);
+  FinishErase(table_.Remove(key, hash));
 }
 
 void LRUCache::Prune() {
   MutexLock l(&mutex_);
+  while (lru_.next != &lru_) {
+    auto *old = lru_.next;
+    assert(old->refs == 1 && old->in_cache);
+    table_.Remove(old->key(), old->hash);
+    Unref(old);
+  }
 }
 
 static const int kNumShardBits = 4;
